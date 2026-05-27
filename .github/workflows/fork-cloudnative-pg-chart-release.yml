@@ -1,0 +1,360 @@
+name: fork-cloudnative-pg-chart-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      operator_ref:
+        description: "Fluxzero cloudnative-pg ref/tag. Empty uses the latest release."
+        required: false
+        default: ""
+      upstream_chart_tag:
+        description: "Upstream chart release tag. Empty uses the latest cloudnative-pg chart release."
+        required: false
+        default: ""
+      chart_suffix:
+        description: "Chart suffix, for example fz.1. Empty derives it from the operator tag or next free fz.N."
+        required: false
+        default: ""
+      target_branch:
+        description: "Fork branch to release from"
+        required: true
+        default: "main"
+      auto_merge:
+        description: "Enable auto-merge on the release PR"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: fork-cloudnative-pg-chart-release-${{ inputs.target_branch || 'main' }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_CHARTS_REPOSITORY: cloudnative-pg/charts
+  OPERATOR_REPOSITORY: fluxzero-io/cloudnative-pg
+  OPERATOR_IMAGE_REPOSITORY: ghcr.io/fluxzero-io/cloudnative-pg
+  TARGET_BRANCH: ${{ inputs.target_branch || 'main' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  release-pr:
+    name: Create chart release PR
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Create Fluxzero Bot installation token
+        id: app-token
+        env:
+          APP_ID: ${{ secrets.FLUXZERO_BOT_APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.FLUXZERO_BOT_PRIVATE_KEY }}
+          FALLBACK_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${APP_ID}" || -z "${APP_PRIVATE_KEY}" ]]; then
+            echo "::warning::Using GITHUB_TOKEN because Fluxzero Bot secrets are not configured."
+            echo "token=${FALLBACK_TOKEN}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          base64url() {
+            openssl base64 -A | tr '+/' '-_' | tr -d '='
+          }
+
+          now="$(date +%s)"
+          iat="$((now - 60))"
+          exp="$((now + 540))"
+          header="$(printf '{"alg":"RS256","typ":"JWT"}' | base64url)"
+          payload="$(printf '{"iat":%s,"exp":%s,"iss":"%s"}' "${iat}" "${exp}" "${APP_ID}" | base64url)"
+
+          key_file="$(mktemp)"
+          trap 'rm -f "${key_file}"' EXIT
+          printf '%s' "${APP_PRIVATE_KEY}" > "${key_file}"
+
+          signature="$(printf '%s.%s' "${header}" "${payload}" \
+            | openssl dgst -sha256 -sign "${key_file}" -binary \
+            | base64url)"
+          jwt="${header}.${payload}.${signature}"
+
+          github_api() {
+            curl --fail-with-body --silent --show-error \
+              --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "$@"
+          }
+
+          installation_id="$(github_api \
+            --header "Authorization: Bearer ${jwt}" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/installation" \
+            | jq -r '.id')"
+
+          if [[ -z "${installation_id}" || "${installation_id}" == "null" ]]; then
+            echo "::error::Could not find a Fluxzero Bot installation for ${GITHUB_REPOSITORY}."
+            exit 1
+          fi
+
+          token="$(github_api \
+            --request POST \
+            --header "Authorization: Bearer ${jwt}" \
+            "https://api.github.com/app/installations/${installation_id}/access_tokens" \
+            | jq -r '.token')"
+
+          if [[ -z "${token}" || "${token}" == "null" ]]; then
+            echo "::error::Could not create a Fluxzero Bot installation token."
+            exit 1
+          fi
+
+          echo "::add-mask::${token}"
+          echo "token=${token}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout chart fork
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Configure git
+        run: |
+          git config user.name "cloudnative-pg chart release"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Resolve release inputs
+        id: release
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          INPUT_OPERATOR_REF: ${{ inputs.operator_ref || '' }}
+          INPUT_UPSTREAM_CHART_TAG: ${{ inputs.upstream_chart_tag || '' }}
+          INPUT_CHART_SUFFIX: ${{ inputs.chart_suffix || '' }}
+        run: |
+          set -euo pipefail
+
+          operator_ref="${INPUT_OPERATOR_REF}"
+          upstream_chart_tag="${INPUT_UPSTREAM_CHART_TAG}"
+          chart_suffix="${INPUT_CHART_SUFFIX}"
+          operator_image_repository="${OPERATOR_IMAGE_REPOSITORY}"
+
+          if [[ -z "${operator_ref}" ]]; then
+            operator_ref="$(gh release list \
+              --repo "${OPERATOR_REPOSITORY}" \
+              --json tagName,publishedAt \
+              --limit 100 \
+              --jq 'sort_by(.publishedAt) | last.tagName')"
+          fi
+
+          if [[ -z "${upstream_chart_tag}" ]]; then
+            upstream_chart_tag="$(gh release list \
+              --repo "${UPSTREAM_CHARTS_REPOSITORY}" \
+              --exclude-pre-releases \
+              --json tagName,publishedAt \
+              --limit 100 \
+              --jq 'map(select(.tagName | startswith("cloudnative-pg-v"))) | sort_by(.publishedAt) | last.tagName')"
+          fi
+
+          if [[ -z "${operator_ref}" || "${operator_ref}" == "null" ]]; then
+            echo "::error::Could not resolve a Fluxzero operator ref."
+            exit 1
+          fi
+
+          if [[ -z "${upstream_chart_tag}" || "${upstream_chart_tag}" == "null" ]]; then
+            echo "::error::Could not resolve an upstream cloudnative-pg chart tag."
+            exit 1
+          fi
+
+          upstream_chart_version="${upstream_chart_tag#cloudnative-pg-v}"
+          operator_version="${operator_ref#v}"
+
+          if [[ -z "${chart_suffix}" && "${operator_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+-(.+)$ ]]; then
+            chart_suffix="${BASH_REMATCH[1]}"
+          fi
+
+          if [[ -z "${chart_suffix}" ]]; then
+            existing_suffixes="$(gh release list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --json tagName \
+              --limit 100 \
+              --jq ".[] | .tagName | select(startswith(\"cloudnative-pg-v${upstream_chart_version}-fz.\"))" || true)"
+            max=0
+            while IFS= read -r release_tag; do
+              [[ -z "${release_tag}" ]] && continue
+              suffix_number="${release_tag##*-fz.}"
+              if [[ "${suffix_number}" =~ ^[0-9]+$ && "${suffix_number}" -gt "${max}" ]]; then
+                max="${suffix_number}"
+              fi
+            done <<< "${existing_suffixes}"
+            chart_suffix="fz.$((max + 1))"
+          fi
+
+          chart_version="${upstream_chart_version}-${chart_suffix}"
+          release_branch="automation/cloudnative-pg-chart-v${chart_version}"
+
+          {
+            echo "operator_ref=${operator_ref}"
+            echo "operator_version=${operator_version}"
+            echo "operator_image_repository=${operator_image_repository}"
+            echo "upstream_chart_tag=${upstream_chart_tag}"
+            echo "upstream_chart_version=${upstream_chart_version}"
+            echo "chart_version=${chart_version}"
+            echo "release_branch=${release_branch}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout operator fork
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          repository: ${{ env.OPERATOR_REPOSITORY }}
+          ref: ${{ steps.release.outputs.operator_ref }}
+          path: operator
+          fetch-depth: 1
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Merge upstream chart release
+        env:
+          UPSTREAM_CHART_TAG: ${{ steps.release.outputs.upstream_chart_tag }}
+          RELEASE_BRANCH: ${{ steps.release.outputs.release_branch }}
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_CHARTS_REPOSITORY}.git"
+          git fetch upstream "refs/tags/${UPSTREAM_CHART_TAG}:refs/tags/${UPSTREAM_CHART_TAG}"
+          git switch -C "${RELEASE_BRANCH}" "origin/${TARGET_BRANCH}"
+          git merge --no-ff --no-edit "${UPSTREAM_CHART_TAG}"
+
+      - name: Set up Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+        with:
+          version: v3.16.2
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Apply Fluxzero chart release changes
+        env:
+          CHART_VERSION: ${{ steps.release.outputs.chart_version }}
+          APP_VERSION: ${{ steps.release.outputs.operator_version }}
+          OPERATOR_IMAGE_REPOSITORY_RESOLVED: ${{ steps.release.outputs.operator_image_repository }}
+        run: |
+          set -euo pipefail
+
+          perl -0pi -e 's/^version: ".*"$/version: "'"${CHART_VERSION}"'"/m; s/^appVersion: ".*"$/appVersion: "'"${APP_VERSION}"'"/m' \
+            charts/cloudnative-pg/Chart.yaml
+
+          perl -0pi -e 's#(^image:\n\s+repository: ).*$#${1}'"${OPERATOR_IMAGE_REPOSITORY_RESOLVED}"'#m' \
+            charts/cloudnative-pg/values.yaml
+
+          perl -0pi -e 's#(\| image\.repository \| string \| `")[^`]+("` \|)#${1}'"${OPERATOR_IMAGE_REPOSITORY_RESOLVED}"'${2}#' \
+            charts/cloudnative-pg/README.md
+
+          {
+            echo '{{- if .Values.crds.create }}'
+            kubectl kustomize operator/config/helm
+            echo '{{- end }}'
+          } > charts/cloudnative-pg/templates/crds/crds.yaml
+
+      - name: Validate chart release
+        env:
+          APP_VERSION: ${{ steps.release.outputs.operator_version }}
+          OPERATOR_IMAGE_REPOSITORY_RESOLVED: ${{ steps.release.outputs.operator_image_repository }}
+        run: |
+          set -euo pipefail
+
+          git diff --check
+          helm repo add cnpg-grafana-dashboard https://cloudnative-pg.github.io/grafana-dashboards
+          helm dependency build charts/cloudnative-pg
+          helm lint charts/cloudnative-pg charts/cluster charts/plugin-barman-cloud
+          helm template cnpg charts/cloudnative-pg >/tmp/cloudnative-pg.yaml
+
+          rg -q 'resizeStrategy' /tmp/cloudnative-pg.yaml
+          rg -q "image: \"${OPERATOR_IMAGE_REPOSITORY_RESOLVED}:${APP_VERSION}\"" /tmp/cloudnative-pg.yaml
+          rg -q "value: \"${OPERATOR_IMAGE_REPOSITORY_RESOLVED}:${APP_VERSION}\"" /tmp/cloudnative-pg.yaml
+
+      - name: Commit release changes
+        id: commit
+        env:
+          CHART_VERSION: ${{ steps.release.outputs.chart_version }}
+          OPERATOR_REF: ${{ steps.release.outputs.operator_ref }}
+        run: |
+          set -euo pipefail
+
+          rm -rf operator
+          git add charts/cloudnative-pg/Chart.yaml \
+            charts/cloudnative-pg/README.md \
+            charts/cloudnative-pg/values.yaml \
+            charts/cloudnative-pg/templates/crds/crds.yaml
+
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No chart release changes to commit."
+            exit 0
+          fi
+
+          git commit -m "chore: release cloudnative-pg chart v${CHART_VERSION}" \
+            -m "Operator ref: ${OPERATOR_REF}"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Push release branch
+        if: steps.commit.outputs.changed == 'true'
+        env:
+          RELEASE_BRANCH: ${{ steps.release.outputs.release_branch }}
+        run: |
+          git push --force-with-lease origin "${RELEASE_BRANCH}"
+
+      - name: Create or update release PR
+        if: steps.commit.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          RELEASE_BRANCH: ${{ steps.release.outputs.release_branch }}
+          CHART_VERSION: ${{ steps.release.outputs.chart_version }}
+          OPERATOR_REF: ${{ steps.release.outputs.operator_ref }}
+          UPSTREAM_CHART_TAG: ${{ steps.release.outputs.upstream_chart_tag }}
+          OPERATOR_IMAGE_REPOSITORY_RESOLVED: ${{ steps.release.outputs.operator_image_repository }}
+          AUTO_MERGE: ${{ inputs.auto_merge || false }}
+        run: |
+          title="Release cloudnative-pg chart v${CHART_VERSION}"
+          body="$(cat <<EOF
+          Automated Fluxzero cloudnative-pg chart release.
+
+          Inputs:
+          - Operator ref: \`${OPERATOR_REF}\`
+          - Operator image: \`${OPERATOR_IMAGE_REPOSITORY_RESOLVED}:${OPERATOR_REF#v}\`
+          - Upstream chart: \`${UPSTREAM_CHART_TAG}\`
+          - Chart version: \`${CHART_VERSION}\`
+
+          This branch was validated with:
+          - \`git diff --check\`
+          - \`helm dependency build charts/cloudnative-pg\`
+          - \`helm lint charts/cloudnative-pg charts/cluster charts/plugin-barman-cloud\`
+          - \`helm template cnpg charts/cloudnative-pg\`
+          - rendered checks for \`resizeStrategy\` and the Fluxzero operator image
+          EOF
+          )"
+
+          pr_number="$(gh pr list \
+            --head "${RELEASE_BRANCH}" \
+            --base "${TARGET_BRANCH}" \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')"
+
+          if [[ -z "${pr_number}" ]]; then
+            pr_url="$(gh pr create \
+              --base "${TARGET_BRANCH}" \
+              --head "${RELEASE_BRANCH}" \
+              --title "${title}" \
+              --body "${body}" \
+              --label release)"
+            pr_number="${pr_url##*/}"
+          else
+            gh pr edit "${pr_number}" \
+              --title "${title}" \
+              --body "${body}" \
+              --add-label release \
+              --base "${TARGET_BRANCH}"
+          fi
+
+          if [[ "${AUTO_MERGE}" == "true" ]]; then
+            gh pr merge "${pr_number}" --auto --merge
+          fi
