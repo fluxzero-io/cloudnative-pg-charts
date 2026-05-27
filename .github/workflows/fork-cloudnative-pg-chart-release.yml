@@ -267,9 +267,9 @@ jobs:
           helm lint charts/cloudnative-pg charts/cluster charts/plugin-barman-cloud
           helm template cnpg charts/cloudnative-pg >/tmp/cloudnative-pg.yaml
 
-          rg -q 'resizeStrategy' /tmp/cloudnative-pg.yaml
-          rg -q "image: \"${OPERATOR_IMAGE_REPOSITORY_RESOLVED}:${APP_VERSION}\"" /tmp/cloudnative-pg.yaml
-          rg -q "value: \"${OPERATOR_IMAGE_REPOSITORY_RESOLVED}:${APP_VERSION}\"" /tmp/cloudnative-pg.yaml
+          grep -q 'resizeStrategy' /tmp/cloudnative-pg.yaml
+          grep -q "image: \"${OPERATOR_IMAGE_REPOSITORY_RESOLVED}:${APP_VERSION}\"" /tmp/cloudnative-pg.yaml
+          grep -q "value: \"${OPERATOR_IMAGE_REPOSITORY_RESOLVED}:${APP_VERSION}\"" /tmp/cloudnative-pg.yaml
 
       - name: Commit release changes
         id: commit
