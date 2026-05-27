@@ -1,0 +1,253 @@
+name: fork-chart-publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      chart_path:
+        description: "Chart path to publish"
+        required: true
+        default: "charts/cloudnative-pg"
+      expected_chart_version:
+        description: "Optional safety check. Empty publishes the version from Chart.yaml."
+        required: false
+        default: ""
+      target_branch:
+        description: "Branch containing the chart release commit"
+        required: true
+        default: "main"
+      publish_pages:
+        description: "Update the GitHub Pages Helm repository index"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+  pages: write
+
+concurrency:
+  group: fork-chart-publish-${{ inputs.chart_path || 'charts/cloudnative-pg' }}
+  cancel-in-progress: false
+
+env:
+  CHART_PATH: ${{ inputs.chart_path || 'charts/cloudnative-pg' }}
+  EXPECTED_CHART_VERSION: ${{ inputs.expected_chart_version || '' }}
+  TARGET_BRANCH: ${{ inputs.target_branch || 'main' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  publish:
+    name: Publish chart
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout chart fork
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "cloudnative-pg chart publish"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Set up Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+        with:
+          version: v3.16.2
+
+      - name: Resolve chart metadata
+        id: chart
+        run: |
+          set -euo pipefail
+
+          metadata="$(helm show chart "${CHART_PATH}")"
+          chart_name="$(awk -F': *' '$1 == "name" { print $2; exit }' <<< "${metadata}")"
+          chart_version="$(awk -F': *' '$1 == "version" { print $2; exit }' <<< "${metadata}")"
+          app_version="$(awk -F': *' '$1 == "appVersion" { print $2; exit }' <<< "${metadata}")"
+
+          if [[ -z "${chart_name}" || -z "${chart_version}" ]]; then
+            echo "::error::Could not resolve chart name and version from ${CHART_PATH}."
+            exit 1
+          fi
+
+          if [[ -n "${EXPECTED_CHART_VERSION}" && "${EXPECTED_CHART_VERSION}" != "${chart_version}" ]]; then
+            echo "::error::Expected chart version ${EXPECTED_CHART_VERSION}, got ${chart_version}."
+            exit 1
+          fi
+
+          release_tag="${chart_name}-v${chart_version}"
+          package_name="${chart_name}-${chart_version}.tgz"
+
+          {
+            echo "name=${chart_name}"
+            echo "version=${chart_version}"
+            echo "app_version=${app_version}"
+            echo "release_tag=${release_tag}"
+            echo "package_name=${package_name}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Build dependencies
+        run: |
+          set -euo pipefail
+
+          helm repo add cnpg-grafana-dashboard https://cloudnative-pg.github.io/grafana-dashboards
+          helm dependency build "${CHART_PATH}"
+
+      - name: Validate chart
+        env:
+          APP_VERSION: ${{ steps.chart.outputs.app_version }}
+        run: |
+          set -euo pipefail
+
+          helm lint "${CHART_PATH}"
+          helm template cnpg "${CHART_PATH}" >/tmp/chart.yaml
+
+          if [[ "${CHART_PATH}" == "charts/cloudnative-pg" ]]; then
+            image_repository="$(awk '$1 == "repository:" { print $2; exit }' "${CHART_PATH}/values.yaml")"
+            grep -q 'resizeStrategy' /tmp/chart.yaml
+            grep -q "image: \"${image_repository}:${APP_VERSION}\"" /tmp/chart.yaml
+            grep -q "value: \"${image_repository}:${APP_VERSION}\"" /tmp/chart.yaml
+          fi
+
+      - name: Package chart
+        id: package
+        env:
+          PACKAGE_NAME: ${{ steps.chart.outputs.package_name }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p .cr-release-packages
+          helm package "${CHART_PATH}" --destination .cr-release-packages
+
+          package_path=".cr-release-packages/${PACKAGE_NAME}"
+          if [[ ! -f "${package_path}" ]]; then
+            echo "::error::Expected package ${package_path} was not created."
+            exit 1
+          fi
+
+          sha256="$(sha256sum "${package_path}" | awk '{ print $1 }')"
+
+          {
+            echo "path=${package_path}"
+            echo "sha256=${sha256}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHART_NAME: ${{ steps.chart.outputs.name }}
+          CHART_VERSION: ${{ steps.chart.outputs.version }}
+          APP_VERSION: ${{ steps.chart.outputs.app_version }}
+          RELEASE_TAG: ${{ steps.chart.outputs.release_tag }}
+          PACKAGE_PATH: ${{ steps.package.outputs.path }}
+          PACKAGE_SHA256: ${{ steps.package.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+
+          notes_file="$(mktemp)"
+          cat > "${notes_file}" <<EOF
+          Fluxzero Helm chart release.
+
+          - Chart: \`${CHART_NAME}\`
+          - Chart version: \`${CHART_VERSION}\`
+          - App version: \`${APP_VERSION}\`
+          - Source: \`${GITHUB_REPOSITORY}@${GITHUB_SHA}\`
+          - Package SHA256: \`${PACKAGE_SHA256}\`
+          EOF
+
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" "${PACKAGE_PATH}" --clobber
+            gh release edit "${RELEASE_TAG}" \
+              --target "${GITHUB_SHA}" \
+              --title "${RELEASE_TAG}" \
+              --notes-file "${notes_file}"
+          else
+            gh release create "${RELEASE_TAG}" "${PACKAGE_PATH}" \
+              --target "${GITHUB_SHA}" \
+              --title "${RELEASE_TAG}" \
+              --notes-file "${notes_file}"
+          fi
+
+      - name: Checkout GitHub Pages branch
+        if: ${{ inputs.publish_pages }}
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: gh-pages
+          path: gh-pages
+          fetch-depth: 0
+
+      - name: Update GitHub Pages chart index
+        if: ${{ inputs.publish_pages }}
+        env:
+          RELEASE_TAG: ${{ steps.chart.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          release_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}"
+          merge_args=()
+          if [[ -f gh-pages/index.yaml ]]; then
+            merge_args=(--merge gh-pages/index.yaml)
+          fi
+
+          helm repo index .cr-release-packages \
+            --url "${release_url}" \
+            "${merge_args[@]}"
+
+          cp .cr-release-packages/index.yaml gh-pages/index.yaml
+
+          git -C gh-pages add index.yaml
+          if git -C gh-pages diff --cached --quiet; then
+            echo "GitHub Pages index already contains this chart package."
+            exit 0
+          fi
+
+          git -C gh-pages commit -m "Publish ${RELEASE_TAG}"
+          git -C gh-pages push origin gh-pages
+
+      - name: Request GitHub Pages build
+        if: ${{ inputs.publish_pages }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          gh api \
+            --method POST \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "repos/${GITHUB_REPOSITORY}/pages/builds" >/dev/null
+
+      - name: Verify published Helm repository
+        if: ${{ inputs.publish_pages }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHART_NAME: ${{ steps.chart.outputs.name }}
+          CHART_VERSION: ${{ steps.chart.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          pages_url="$(gh api "repos/${GITHUB_REPOSITORY}/pages" --jq '.html_url')"
+          pages_url="${pages_url%/}"
+
+          for attempt in {1..30}; do
+            if curl --fail --silent --show-error \
+              --header "Cache-Control: no-cache" \
+              "${pages_url}/index.yaml?attempt=${attempt}" \
+              | grep -q "version: ${CHART_VERSION}"; then
+              helm repo add fluxzero-cnpg "${pages_url}"
+              helm repo update fluxzero-cnpg
+              helm pull "fluxzero-cnpg/${CHART_NAME}" \
+                --version "${CHART_VERSION}" \
+                --destination /tmp/published-chart
+              exit 0
+            fi
+
+            sleep 10
+          done
+
+          echo "::error::Published Helm repository did not expose ${CHART_NAME} ${CHART_VERSION} in time."
+          exit 1
