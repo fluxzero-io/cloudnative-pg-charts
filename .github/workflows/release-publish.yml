@@ -7,7 +7,6 @@ permissions: read-all
 
 jobs:
   release:
-    if: ${{ false }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write # Required for pushing the Helm charts to the gh-pages branch
