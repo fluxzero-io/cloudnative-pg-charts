@@ -332,11 +332,13 @@ jobs:
           EOF
           )"
 
-          pr_number="$(gh pr list \
-            --head "${RELEASE_BRANCH}" \
-            --base "${TARGET_BRANCH}" \
-            --state open \
-            --json number \
+          pr_number="$(gh api \
+            --method GET \
+            --header "Accept: application/vnd.github+json" \
+            -f "head=${GITHUB_REPOSITORY_OWNER}:${RELEASE_BRANCH}" \
+            -f "base=${TARGET_BRANCH}" \
+            -f "state=open" \
+            "repos/${GITHUB_REPOSITORY}/pulls" \
             --jq '.[0].number // empty')"
 
           if [[ -z "${pr_number}" ]]; then
