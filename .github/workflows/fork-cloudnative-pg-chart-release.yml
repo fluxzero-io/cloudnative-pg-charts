@@ -305,7 +305,7 @@ jobs:
       - name: Create or update release PR
         if: steps.commit.outputs.changed == 'true'
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
           RELEASE_BRANCH: ${{ steps.release.outputs.release_branch }}
           CHART_VERSION: ${{ steps.release.outputs.chart_version }}
           OPERATOR_REF: ${{ steps.release.outputs.operator_ref }}
@@ -340,20 +340,36 @@ jobs:
             --jq '.[0].number // empty')"
 
           if [[ -z "${pr_number}" ]]; then
-            pr_url="$(gh pr create \
-              --base "${TARGET_BRANCH}" \
-              --head "${RELEASE_BRANCH}" \
-              --title "${title}" \
-              --body "${body}" \
-              --label release)"
-            pr_number="${pr_url##*/}"
+            pr_number="$(jq -n \
+              --arg title "${title}" \
+              --arg head "${RELEASE_BRANCH}" \
+              --arg base "${TARGET_BRANCH}" \
+              --arg body "${body}" \
+              '{title: $title, head: $head, base: $base, body: $body, maintainer_can_modify: true}' \
+              | gh api \
+                  --method POST \
+                  --header "Accept: application/vnd.github+json" \
+                  --input - \
+                  "repos/${GITHUB_REPOSITORY}/pulls" \
+                  --jq '.number')"
           else
-            gh pr edit "${pr_number}" \
-              --title "${title}" \
-              --body "${body}" \
-              --add-label release \
-              --base "${TARGET_BRANCH}"
+            jq -n \
+              --arg title "${title}" \
+              --arg body "${body}" \
+              --arg base "${TARGET_BRANCH}" \
+              '{title: $title, body: $body, base: $base}' \
+              | gh api \
+                  --method PATCH \
+                  --header "Accept: application/vnd.github+json" \
+                  --input - \
+                  "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}" >/dev/null
           fi
+
+          gh api \
+            --method POST \
+            --header "Accept: application/vnd.github+json" \
+            "repos/${GITHUB_REPOSITORY}/issues/${pr_number}/labels" \
+            -f labels[]=release >/dev/null
 
           if [[ "${AUTO_MERGE}" == "true" ]]; then
             gh pr merge "${pr_number}" --auto --merge
