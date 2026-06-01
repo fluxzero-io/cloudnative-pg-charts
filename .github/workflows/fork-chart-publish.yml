@@ -187,6 +187,9 @@ jobs:
         run: |
           set -euo pipefail
 
+          git -C gh-pages config user.name "cloudnative-pg chart publish"
+          git -C gh-pages config user.email "github-actions[bot]@users.noreply.github.com"
+
           release_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}"
           merge_args=()
           if [[ -f gh-pages/index.yaml ]]; then
