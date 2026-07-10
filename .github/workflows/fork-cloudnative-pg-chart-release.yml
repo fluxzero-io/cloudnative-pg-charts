@@ -412,6 +412,7 @@ jobs:
 
       - name: Create or update release PR
         if: steps.release.outputs.ready == 'true' && steps.commit.outputs.changed == 'true'
+        timeout-minutes: 45
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           RELEASE_BRANCH: ${{ steps.release.outputs.release_branch }}
@@ -483,5 +484,38 @@ jobs:
             -f labels[]=release >/dev/null
 
           if [[ "${AUTO_MERGE}" == "true" ]]; then
-            gh pr merge "${pr_number}" --repo "${GITHUB_REPOSITORY}" --auto --merge
+            previous_check_count=-1
+            stable_samples=0
+
+            for _ in {1..24}; do
+              check_count="$(gh pr view "${pr_number}" \
+                --repo "${GITHUB_REPOSITORY}" \
+                --json statusCheckRollup \
+                --jq '.statusCheckRollup | length')"
+
+              if (( check_count > 0 && check_count == previous_check_count )); then
+                stable_samples=$((stable_samples + 1))
+              else
+                stable_samples=0
+              fi
+
+              if (( stable_samples >= 2 )); then
+                break
+              fi
+
+              previous_check_count="${check_count}"
+              sleep 5
+            done
+
+            if (( check_count == 0 || stable_samples < 2 )); then
+              echo "::error::Timed out waiting for checks to register on PR #${pr_number}."
+              exit 1
+            fi
+
+            gh pr checks "${pr_number}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --watch \
+              --fail-fast \
+              --interval 10
+            gh pr merge "${pr_number}" --repo "${GITHUB_REPOSITORY}" --merge
           fi
