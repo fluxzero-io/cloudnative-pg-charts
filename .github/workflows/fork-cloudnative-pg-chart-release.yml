@@ -483,5 +483,5 @@ jobs:
             -f labels[]=release >/dev/null
 
           if [[ "${AUTO_MERGE}" == "true" ]]; then
-            gh pr merge "${pr_number}" --auto --merge
+            gh pr merge "${pr_number}" --repo "${GITHUB_REPOSITORY}" --auto --merge
           fi
