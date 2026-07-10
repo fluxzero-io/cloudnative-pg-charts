@@ -1,6 +1,11 @@
 name: fork-chart-publish
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - "charts/cloudnative-pg/**"
   workflow_dispatch:
     inputs:
       chart_path:
@@ -26,13 +31,14 @@ permissions:
   pages: write
 
 concurrency:
-  group: fork-chart-publish-${{ inputs.chart_path || 'charts/cloudnative-pg' }}
+  group: fork-chart-publish-${{ github.event.inputs.chart_path || 'charts/cloudnative-pg' }}
   cancel-in-progress: false
 
 env:
-  CHART_PATH: ${{ inputs.chart_path || 'charts/cloudnative-pg' }}
-  EXPECTED_CHART_VERSION: ${{ inputs.expected_chart_version || '' }}
-  TARGET_BRANCH: ${{ inputs.target_branch || 'main' }}
+  CHART_PATH: ${{ github.event.inputs.chart_path || 'charts/cloudnative-pg' }}
+  EXPECTED_CHART_VERSION: ${{ github.event.inputs.expected_chart_version || '' }}
+  TARGET_BRANCH: ${{ github.event.inputs.target_branch || github.ref_name || 'main' }}
+  PUBLISH_PAGES: ${{ github.event_name == 'push' || github.event.inputs.publish_pages == 'true' }}
 
 defaults:
   run:
@@ -173,7 +179,7 @@ jobs:
           fi
 
       - name: Checkout GitHub Pages branch
-        if: ${{ inputs.publish_pages }}
+        if: env.PUBLISH_PAGES == 'true'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           ref: gh-pages
@@ -181,7 +187,7 @@ jobs:
           fetch-depth: 0
 
       - name: Update GitHub Pages chart index
-        if: ${{ inputs.publish_pages }}
+        if: env.PUBLISH_PAGES == 'true'
         env:
           RELEASE_TAG: ${{ steps.chart.outputs.release_tag }}
         run: |
@@ -212,7 +218,7 @@ jobs:
           git -C gh-pages push origin gh-pages
 
       - name: Request GitHub Pages build
-        if: ${{ inputs.publish_pages }}
+        if: env.PUBLISH_PAGES == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -225,7 +231,7 @@ jobs:
             "repos/${GITHUB_REPOSITORY}/pages/builds" >/dev/null
 
       - name: Verify published Helm repository
-        if: ${{ inputs.publish_pages }}
+        if: env.PUBLISH_PAGES == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           CHART_NAME: ${{ steps.chart.outputs.name }}

@@ -7,6 +7,10 @@ on:
         description: "Fluxzero cloudnative-pg ref/tag. Empty uses the latest release."
         required: false
         default: ""
+      operator_image_tag:
+        description: "Operator image tag to use in Chart.appVersion. Empty derives it from operator_ref."
+        required: false
+        default: ""
       upstream_chart_tag:
         description: "Upstream chart release tag. Empty uses the latest cloudnative-pg chart release."
         required: false
@@ -130,12 +134,14 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           INPUT_OPERATOR_REF: ${{ inputs.operator_ref || '' }}
+          INPUT_OPERATOR_IMAGE_TAG: ${{ inputs.operator_image_tag || '' }}
           INPUT_UPSTREAM_CHART_TAG: ${{ inputs.upstream_chart_tag || '' }}
           INPUT_CHART_SUFFIX: ${{ inputs.chart_suffix || '' }}
         run: |
           set -euo pipefail
 
           operator_ref="${INPUT_OPERATOR_REF}"
+          operator_image_tag="${INPUT_OPERATOR_IMAGE_TAG}"
           upstream_chart_tag="${INPUT_UPSTREAM_CHART_TAG}"
           chart_suffix="${INPUT_CHART_SUFFIX}"
           operator_image_repository="${OPERATOR_IMAGE_REPOSITORY}"
@@ -169,6 +175,9 @@ jobs:
 
           upstream_chart_version="${upstream_chart_tag#cloudnative-pg-v}"
           operator_version="${operator_ref#v}"
+          if [[ -z "${operator_image_tag}" ]]; then
+            operator_image_tag="${operator_version}"
+          fi
 
           if [[ -z "${chart_suffix}" && "${operator_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+-(.+)$ ]]; then
             chart_suffix="${BASH_REMATCH[1]}"
@@ -197,6 +206,7 @@ jobs:
           {
             echo "operator_ref=${operator_ref}"
             echo "operator_version=${operator_version}"
+            echo "operator_image_tag=${operator_image_tag}"
             echo "operator_image_repository=${operator_image_repository}"
             echo "upstream_chart_tag=${upstream_chart_tag}"
             echo "upstream_chart_version=${upstream_chart_version}"
@@ -234,7 +244,7 @@ jobs:
       - name: Apply Fluxzero chart release changes
         env:
           CHART_VERSION: ${{ steps.release.outputs.chart_version }}
-          APP_VERSION: ${{ steps.release.outputs.operator_version }}
+          APP_VERSION: ${{ steps.release.outputs.operator_image_tag }}
           OPERATOR_IMAGE_REPOSITORY_RESOLVED: ${{ steps.release.outputs.operator_image_repository }}
         run: |
           set -euo pipefail
@@ -256,7 +266,7 @@ jobs:
 
       - name: Validate chart release
         env:
-          APP_VERSION: ${{ steps.release.outputs.operator_version }}
+          APP_VERSION: ${{ steps.release.outputs.operator_image_tag }}
           OPERATOR_IMAGE_REPOSITORY_RESOLVED: ${{ steps.release.outputs.operator_image_repository }}
         run: |
           set -euo pipefail
@@ -309,6 +319,7 @@ jobs:
           RELEASE_BRANCH: ${{ steps.release.outputs.release_branch }}
           CHART_VERSION: ${{ steps.release.outputs.chart_version }}
           OPERATOR_REF: ${{ steps.release.outputs.operator_ref }}
+          OPERATOR_IMAGE_TAG: ${{ steps.release.outputs.operator_image_tag }}
           UPSTREAM_CHART_TAG: ${{ steps.release.outputs.upstream_chart_tag }}
           OPERATOR_IMAGE_REPOSITORY_RESOLVED: ${{ steps.release.outputs.operator_image_repository }}
           AUTO_MERGE: ${{ inputs.auto_merge || false }}
@@ -319,7 +330,7 @@ jobs:
 
           Inputs:
           - Operator ref: \`${OPERATOR_REF}\`
-          - Operator image: \`${OPERATOR_IMAGE_REPOSITORY_RESOLVED}:${OPERATOR_REF#v}\`
+          - Operator image: \`${OPERATOR_IMAGE_REPOSITORY_RESOLVED}:${OPERATOR_IMAGE_TAG}\`
           - Upstream chart: \`${UPSTREAM_CHART_TAG}\`
           - Chart version: \`${CHART_VERSION}\`
 
