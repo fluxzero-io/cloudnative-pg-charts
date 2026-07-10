@@ -39,6 +39,7 @@ env:
   EXPECTED_CHART_VERSION: ${{ github.event.inputs.expected_chart_version || '' }}
   TARGET_BRANCH: ${{ github.event.inputs.target_branch || github.ref_name || 'main' }}
   PUBLISH_PAGES: ${{ github.event_name == 'push' || github.event.inputs.publish_pages == 'true' }}
+  INFRA_REPOSITORY: fluxzero-io/flux-host-infra-exoscale
 
 defaults:
   run:
@@ -271,3 +272,26 @@ jobs:
 
           echo "::error::Published Helm repository did not expose ${CHART_NAME} ${CHART_VERSION} in time."
           exit 1
+
+      - name: Create infra update app token
+        id: infra-update-token
+        if: env.PUBLISH_PAGES == 'true' && env.CHART_PATH == 'charts/cloudnative-pg'
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.FLUXZERO_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.FLUXZERO_BOT_PRIVATE_KEY }}
+          owner: fluxzero-io
+          repositories: flux-host-infra-exoscale
+          permission-actions: write
+          permission-contents: read
+
+      - name: Dispatch infra update
+        if: env.PUBLISH_PAGES == 'true' && env.CHART_PATH == 'charts/cloudnative-pg'
+        env:
+          GH_TOKEN: ${{ steps.infra-update-token.outputs.token }}
+        run: |
+          set -euo pipefail
+
+          gh workflow run update-flux-runtime-images.yml \
+            --repo "${INFRA_REPOSITORY}" \
+            --ref main

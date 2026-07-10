@@ -1,6 +1,8 @@
 name: fork-cloudnative-pg-chart-release
 
 on:
+  schedule:
+    - cron: "47 */2 * * *"
   workflow_dispatch:
     inputs:
       operator_ref:
@@ -11,8 +13,12 @@ on:
         description: "Operator image tag to use in Chart.appVersion. Empty derives it from operator_ref."
         required: false
         default: ""
+      operator_upstream_version:
+        description: "Stable upstream operator version, for example v1.30.0. Empty derives it from the image tag."
+        required: false
+        default: ""
       upstream_chart_tag:
-        description: "Upstream chart release tag. Empty uses the latest cloudnative-pg chart release."
+        description: "Upstream chart release tag. Empty selects the newest chart compatible with the operator version."
         required: false
         default: ""
       chart_suffix:
@@ -135,6 +141,7 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           INPUT_OPERATOR_REF: ${{ inputs.operator_ref || '' }}
           INPUT_OPERATOR_IMAGE_TAG: ${{ inputs.operator_image_tag || '' }}
+          INPUT_OPERATOR_UPSTREAM_VERSION: ${{ inputs.operator_upstream_version || '' }}
           INPUT_UPSTREAM_CHART_TAG: ${{ inputs.upstream_chart_tag || '' }}
           INPUT_CHART_SUFFIX: ${{ inputs.chart_suffix || '' }}
         run: |
@@ -142,25 +149,20 @@ jobs:
 
           operator_ref="${INPUT_OPERATOR_REF}"
           operator_image_tag="${INPUT_OPERATOR_IMAGE_TAG}"
+          operator_upstream_version="${INPUT_OPERATOR_UPSTREAM_VERSION#v}"
           upstream_chart_tag="${INPUT_UPSTREAM_CHART_TAG}"
           chart_suffix="${INPUT_CHART_SUFFIX}"
           operator_image_repository="${OPERATOR_IMAGE_REPOSITORY}"
+
+          git remote add upstream "https://github.com/${UPSTREAM_CHARTS_REPOSITORY}.git" || true
+          git fetch --tags upstream
 
           if [[ -z "${operator_ref}" ]]; then
             operator_ref="$(gh release list \
               --repo "${OPERATOR_REPOSITORY}" \
               --json tagName,publishedAt \
-              --limit 100 \
-              --jq 'sort_by(.publishedAt) | last.tagName')"
-          fi
-
-          if [[ -z "${upstream_chart_tag}" ]]; then
-            upstream_chart_tag="$(gh release list \
-              --repo "${UPSTREAM_CHARTS_REPOSITORY}" \
-              --exclude-pre-releases \
-              --json tagName,publishedAt \
-              --limit 100 \
-              --jq 'map(select(.tagName | startswith("cloudnative-pg-v"))) | sort_by(.publishedAt) | last.tagName')"
+              --limit 250 \
+              --jq 'map(select(.tagName | test("^v[0-9]+\\.[0-9]+\\.[0-9]+-fz\\.[0-9]+\\.[0-9]+$"))) | sort_by(.publishedAt) | last.tagName')"
           fi
 
           if [[ -z "${operator_ref}" || "${operator_ref}" == "null" ]]; then
@@ -168,26 +170,83 @@ jobs:
             exit 1
           fi
 
-          if [[ -z "${upstream_chart_tag}" || "${upstream_chart_tag}" == "null" ]]; then
-            echo "::error::Could not resolve an upstream cloudnative-pg chart tag."
-            exit 1
-          fi
-
-          upstream_chart_version="${upstream_chart_tag#cloudnative-pg-v}"
           operator_version="${operator_ref#v}"
           if [[ -z "${operator_image_tag}" ]]; then
             operator_image_tag="${operator_version}"
           fi
 
-          if [[ -z "${chart_suffix}" && "${operator_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+-(.+)$ ]]; then
-            chart_suffix="${BASH_REMATCH[1]}"
+          if [[ -z "${operator_upstream_version}" && "${operator_image_tag}" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-fz\.[0-9]+\.[0-9]+$ ]]; then
+            operator_upstream_version="${BASH_REMATCH[1]}"
+          fi
+
+          if [[ ! "${operator_upstream_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Could not derive a stable upstream operator version from '${operator_image_tag}'."
+            exit 1
+          fi
+
+          chart_targets_operator() {
+            local chart_app_version="$1"
+            local newest
+
+            [[ "${chart_app_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+            [[ "${chart_app_version%.*}" == "${operator_upstream_version%.*}" ]] || return 1
+            newest="$(printf '%s\n%s\n' "${chart_app_version}" "${operator_upstream_version}" | sort -V | tail -n 1)"
+            [[ "${newest}" == "${operator_upstream_version}" ]]
+          }
+
+          current_chart_version="$(awk -F': *' '$1 == "version" { gsub(/"/, "", $2); print $2; exit }' charts/cloudnative-pg/Chart.yaml)"
+          current_upstream_chart_version="${current_chart_version%%-fz.*}"
+          current_app_version="$(awk -F': *' '$1 == "appVersion" { gsub(/"/, "", $2); print $2; exit }' charts/cloudnative-pg/Chart.yaml)"
+
+          if [[ "${current_app_version}" == "${operator_image_tag}" ]]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "Chart ${current_chart_version} already uses operator ${operator_image_tag}." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [[ -n "${upstream_chart_tag}" ]]; then
+            if [[ ! "${upstream_chart_tag}" =~ ^cloudnative-pg-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Expected a stable upstream chart tag, got '${upstream_chart_tag}'."
+              exit 1
+            fi
+
+            candidate_app_version="$(git show "${upstream_chart_tag}:charts/cloudnative-pg/Chart.yaml" \
+              | awk -F': *' '$1 == "appVersion" { gsub(/"/, "", $2); print $2; exit }')"
+            if ! chart_targets_operator "${candidate_app_version}"; then
+              echo "::error::Chart ${upstream_chart_tag} targets operator ${candidate_app_version}, which is incompatible with ${operator_upstream_version}."
+              exit 1
+            fi
+          else
+            while IFS= read -r candidate; do
+              [[ "${candidate}" =~ ^cloudnative-pg-v[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+              candidate_app_version="$(git show "${candidate}:charts/cloudnative-pg/Chart.yaml" \
+                | awk -F': *' '$1 == "appVersion" { gsub(/"/, "", $2); print $2; exit }')"
+              if chart_targets_operator "${candidate_app_version}"; then
+                upstream_chart_tag="${candidate}"
+                break
+              fi
+            done < <(git tag --list 'cloudnative-pg-v*' --sort=-version:refname)
+          fi
+
+          if [[ -z "${upstream_chart_tag}" ]]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "No stable upstream chart is compatible with operator ${operator_upstream_version} yet; a scheduled run will retry." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          upstream_chart_version="${upstream_chart_tag#cloudnative-pg-v}"
+          highest_chart_version="$(printf '%s\n%s\n' "${current_upstream_chart_version}" "${upstream_chart_version}" | sort -V | tail -n 1)"
+          if [[ "${upstream_chart_version}" != "${highest_chart_version}" ]]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "Refusing to move chart base backwards from ${current_upstream_chart_version} to ${upstream_chart_version}." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
 
           if [[ -z "${chart_suffix}" ]]; then
             existing_suffixes="$(gh release list \
               --repo "${GITHUB_REPOSITORY}" \
               --json tagName \
-              --limit 100 \
+              --limit 250 \
               --jq ".[] | .tagName | select(startswith(\"cloudnative-pg-v${upstream_chart_version}-fz.\"))" || true)"
             max=0
             while IFS= read -r release_tag; do
@@ -204,9 +263,11 @@ jobs:
           release_branch="automation/cloudnative-pg-chart-v${chart_version}"
 
           {
+            echo "ready=true"
             echo "operator_ref=${operator_ref}"
             echo "operator_version=${operator_version}"
             echo "operator_image_tag=${operator_image_tag}"
+            echo "operator_upstream_version=${operator_upstream_version}"
             echo "operator_image_repository=${operator_image_repository}"
             echo "upstream_chart_tag=${upstream_chart_tag}"
             echo "upstream_chart_version=${upstream_chart_version}"
@@ -215,6 +276,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Checkout operator fork
+        if: steps.release.outputs.ready == 'true'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           repository: ${{ env.OPERATOR_REPOSITORY }}
@@ -224,24 +286,58 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
 
       - name: Merge upstream chart release
+        if: steps.release.outputs.ready == 'true'
         env:
           UPSTREAM_CHART_TAG: ${{ steps.release.outputs.upstream_chart_tag }}
           RELEASE_BRANCH: ${{ steps.release.outputs.release_branch }}
         run: |
-          git remote add upstream "https://github.com/${UPSTREAM_CHARTS_REPOSITORY}.git"
-          git fetch upstream "refs/tags/${UPSTREAM_CHART_TAG}:refs/tags/${UPSTREAM_CHART_TAG}"
+          set -euo pipefail
+
           git switch -C "${RELEASE_BRANCH}" "origin/${TARGET_BRANCH}"
-          git merge --no-ff --no-edit "${UPSTREAM_CHART_TAG}"
+          if ! git merge --no-ff --no-edit "${UPSTREAM_CHART_TAG}"; then
+            mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
+            allowed_conflicts=(
+              "charts/cloudnative-pg/Chart.yaml"
+              "charts/cloudnative-pg/templates/crds/crds.yaml"
+              "charts/cluster/test/console-statefulset/chainsaw-test.yaml"
+            )
+
+            if [[ "${#conflicts[@]}" -eq 0 ]]; then
+              echo "::error::Upstream merge failed without merge conflicts."
+              exit 1
+            fi
+
+            for conflict in "${conflicts[@]}"; do
+              allowed=false
+              for expected in "${allowed_conflicts[@]}"; do
+                if [[ "${conflict}" == "${expected}" ]]; then
+                  allowed=true
+                  break
+                fi
+              done
+              if [[ "${allowed}" != "true" ]]; then
+                echo "::error::Unexpected upstream merge conflict: ${conflict}"
+                exit 1
+              fi
+            done
+
+            git checkout --theirs -- "${conflicts[@]}"
+            git add -- "${conflicts[@]}"
+            git commit --no-edit
+          fi
 
       - name: Set up Helm
+        if: steps.release.outputs.ready == 'true'
         uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
         with:
           version: v3.16.2
 
       - name: Set up kubectl
+        if: steps.release.outputs.ready == 'true'
         uses: azure/setup-kubectl@v4
 
       - name: Apply Fluxzero chart release changes
+        if: steps.release.outputs.ready == 'true'
         env:
           CHART_VERSION: ${{ steps.release.outputs.chart_version }}
           APP_VERSION: ${{ steps.release.outputs.operator_image_tag }}
@@ -265,6 +361,7 @@ jobs:
           } > charts/cloudnative-pg/templates/crds/crds.yaml
 
       - name: Validate chart release
+        if: steps.release.outputs.ready == 'true'
         env:
           APP_VERSION: ${{ steps.release.outputs.operator_image_tag }}
           OPERATOR_IMAGE_REPOSITORY_RESOLVED: ${{ steps.release.outputs.operator_image_repository }}
@@ -282,6 +379,7 @@ jobs:
           grep -q "value: \"${OPERATOR_IMAGE_REPOSITORY_RESOLVED}:${APP_VERSION}\"" /tmp/cloudnative-pg.yaml
 
       - name: Commit release changes
+        if: steps.release.outputs.ready == 'true'
         id: commit
         env:
           CHART_VERSION: ${{ steps.release.outputs.chart_version }}
@@ -306,23 +404,23 @@ jobs:
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
       - name: Push release branch
-        if: steps.commit.outputs.changed == 'true'
+        if: steps.release.outputs.ready == 'true' && steps.commit.outputs.changed == 'true'
         env:
           RELEASE_BRANCH: ${{ steps.release.outputs.release_branch }}
         run: |
           git push --force-with-lease origin "${RELEASE_BRANCH}"
 
       - name: Create or update release PR
-        if: steps.commit.outputs.changed == 'true'
+        if: steps.release.outputs.ready == 'true' && steps.commit.outputs.changed == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           RELEASE_BRANCH: ${{ steps.release.outputs.release_branch }}
           CHART_VERSION: ${{ steps.release.outputs.chart_version }}
           OPERATOR_REF: ${{ steps.release.outputs.operator_ref }}
           OPERATOR_IMAGE_TAG: ${{ steps.release.outputs.operator_image_tag }}
           UPSTREAM_CHART_TAG: ${{ steps.release.outputs.upstream_chart_tag }}
           OPERATOR_IMAGE_REPOSITORY_RESOLVED: ${{ steps.release.outputs.operator_image_repository }}
-          AUTO_MERGE: ${{ inputs.auto_merge || false }}
+          AUTO_MERGE: ${{ github.event_name == 'schedule' || inputs.auto_merge }}
         run: |
           title="Release cloudnative-pg chart v${CHART_VERSION}"
           body="$(cat <<EOF
