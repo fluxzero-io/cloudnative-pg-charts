@@ -45,4 +45,7 @@ spec:
       try:
         - script:
             content: |
+              set -eu
+              kubectl -n "$NAMESPACE" scale statefulset/console-test-cluster-console --replicas=0
+              kubectl -n "$NAMESPACE" wait --for=delete pod/console-test-cluster-console-0 --timeout=60s
               helm uninstall --namespace "$NAMESPACE" --wait --timeout 3m console-test
