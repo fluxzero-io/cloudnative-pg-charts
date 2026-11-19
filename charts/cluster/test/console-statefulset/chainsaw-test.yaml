@@ -8,7 +8,7 @@ spec:
   timeouts:
     apply: 1s
     assert: 10s
-    cleanup: 1m
+    cleanup: 3m
     exec: 5m
   steps:
     - name: Install a cluster with a console enabled
@@ -31,7 +31,7 @@ spec:
               kubectl -n "$NAMESPACE" wait --for=condition=ready "pod/$pod" --timeout=90s
               kubectl -n "$NAMESPACE" exec "$pod" -- bash -ec '
                 until command -v psql >/dev/null && psql "$DB_SUPERUSER_URI" -c "SELECT 1"; do sleep 2; done
-                PGAPPNAME=console-background nohup psql "$DB_SUPERUSER_URI" -c "SELECT pg_sleep(120)" </dev/null >command.log 2>&1 &
+                PGAPPNAME=console-background nohup psql "$DB_SUPERUSER_URI" -c "SELECT pg_sleep(30)" </dev/null >command.log 2>&1 &
               '
               # Observe the query from a new session after the launching exec has returned.
               kubectl -n "$NAMESPACE" exec "$pod" -- bash -ec '
@@ -45,4 +45,4 @@ spec:
       try:
         - script:
             content: |
-              helm uninstall --namespace $NAMESPACE console-test
+              helm uninstall --namespace "$NAMESPACE" --wait --timeout 3m console-test
