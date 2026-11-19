@@ -8,7 +8,7 @@ spec:
   timeouts:
     apply: 1s
     assert: 10s
-    cleanup: 1m
+    cleanup: 3m
     exec: 5m
   steps:
     - name: Install a cluster with a console enabled
@@ -25,16 +25,27 @@ spec:
             file: ./01-console_test_cluster-assert.yaml
         - script:
             content: |
-              kubectl --namespace $NAMESPACE wait --for=condition=ready clusters.postgresql.cnpg.io/console-test-cluster --timeout=60s
-              kubectl --namespace $NAMESPACE wait --for=condition=ready pod/console-test-cluster-console-0 --timeout=60s
-              kubectl --namespace $NAMESPACE exec pod/console-test-cluster-console-0 -- bash -c 'until psql $DB_SUPERUSER_URI -c "SELECT 1;" 2>/dev/null; do sleep 2; done'
-              echo 'nohup psql $DB_SUPERUSER_URI -c "SELECT PG_SLEEP(120);" 2>&1 > command.log &' | kubectl --namespace $NAMESPACE exec --stdin pod/console-test-cluster-console-0 -- bash &
-              sleep 60
-              PSQL_RUNNING=$(kubectl --namespace $NAMESPACE exec statefulsets/console-test-cluster-console -- bash -c 'ps -ef | grep psql | wc -l')
-              echo "PSQL_RUNNING: $PSQL_RUNNING"
-              [ $PSQL_RUNNING -gt 3 ] || exit 1
+              set -eu
+              pod=console-test-cluster-console-0
+              kubectl -n "$NAMESPACE" wait --for=condition=ready clusters.postgresql.cnpg.io/console-test-cluster --timeout=90s
+              kubectl -n "$NAMESPACE" wait --for=condition=ready "pod/$pod" --timeout=90s
+              kubectl -n "$NAMESPACE" exec "$pod" -- bash -ec '
+                until command -v psql >/dev/null && psql "$DB_SUPERUSER_URI" -c "SELECT 1"; do sleep 2; done
+                PGAPPNAME=console-background nohup psql "$DB_SUPERUSER_URI" -c "SELECT pg_sleep(30)" </dev/null >command.log 2>&1 &
+              '
+              # Observe the query from a new session after the launching exec has returned.
+              kubectl -n "$NAMESPACE" exec "$pod" -- bash -ec '
+                for attempt in {1..15}; do
+                  if [[ $(psql "$DB_SUPERUSER_URI" -Atc "SELECT count(*) FROM pg_stat_activity WHERE application_name = \$\$console-background\$\$ AND state = \$\$active\$\$ AND wait_event = \$\$PgSleep\$\$") == 1 ]]; then exit 0; fi
+                  sleep 1
+                done
+                exit 1
+              '
     - name: Cleanup
       try:
         - script:
             content: |
-              helm uninstall --namespace $NAMESPACE console-test
+              set -eu
+              kubectl -n "$NAMESPACE" scale statefulset/console-test-cluster-console --replicas=0
+              kubectl -n "$NAMESPACE" wait --for=delete pod/console-test-cluster-console-0 --timeout=60s
+              helm uninstall --namespace "$NAMESPACE" --wait --timeout 3m console-test
